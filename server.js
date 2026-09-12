@@ -10,11 +10,39 @@ const children = new Map();
 const pairings = new Map();
 
 function parentAuth(req, res, next) {
-  const token = req.header('x-api-key');
-  if (!process.env.API_KEY || token !== process.env.API_KEY) {
+  const token = String(req.header('x-api-key') || '').trim();
+  const valid = String(process.env.API_KEY || '').trim();
+  if (!valid || token !== valid) {
     return res.status(401).json({ error: 'unauthorized' });
   }
   req.authRole = 'parent';
+  next();
+}
+
+// Child APK bootstrap authentication. This key is used only to obtain a per-device token.
+function bootstrapAuth(req, res, next) {
+  // Render environment variables sometimes contain accidental whitespace after paste.
+  // Normalize both the incoming header and the configured value before comparing.
+  const token = String(req.header('x-setup-key') || req.header('x-api-key') || '').trim();
+  const candidates = [
+    process.env.SETUP_KEY,
+    process.env.PARENT_CONTROL_SETUP_KEY,
+    process.env.API_KEY
+  ].map(v => String(v || '').trim()).filter(Boolean);
+
+  const matched = candidates.some(valid => {
+    const a = Buffer.from(token);
+    const b = Buffer.from(valid);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  });
+
+  if (!matched) {
+    return res.status(401).json({
+      error: 'unauthorized_bootstrap',
+      message: 'SETUP_KEY eşleşmedi'
+    });
+  }
+  req.authRole = 'bootstrap';
   next();
 }
 
@@ -61,8 +89,17 @@ function createChild(childId, name = 'Çocuk') {
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+// Safe diagnostic endpoint: reveals only whether server secrets are configured.
+app.get('/config-status', (req, res) => {
+  res.json({
+    ok: true,
+    apiKeyConfigured: Boolean(String(process.env.API_KEY || '').trim()),
+    setupKeyConfigured: Boolean(String(process.env.SETUP_KEY || process.env.PARENT_CONTROL_SETUP_KEY || '').trim())
+  });
+});
+
 // Bootstrap endpoint: only the parent API key may provision/refresh a device token.
-app.post('/register', parentAuth, (req, res) => {
+app.post('/register', bootstrapAuth, (req, res) => {
   const { childId, name } = req.body || {};
   if (!childId) return res.status(400).json({ error: 'childId' });
 
@@ -164,6 +201,23 @@ app.post('/policy', parentAuth, (req, res) => {
 });
 
 app.post('/children/:childId/ring', parentAuth, (req, res) => {
+  const childId = String(req.params.childId || '');
+  const c = children.get(childId);
+  if (!c) return res.status(404).json({ error: 'child_not_found' });
+  c.commands.push({ id: crypto.randomUUID(), type: 'ring', createdAt: Date.now() });
+  res.json({ ok: true });
+});
+
+// Backward-compatible aliases for older parent APKs / reverse proxies.
+app.post('/ring/:childId', parentAuth, (req, res) => {
+  const childId = String(req.params.childId || '');
+  const c = children.get(childId);
+  if (!c) return res.status(404).json({ error: 'child_not_found' });
+  c.commands.push({ id: crypto.randomUUID(), type: 'ring', createdAt: Date.now() });
+  res.json({ ok: true });
+});
+
+app.post('/children/:childId/command/ring', parentAuth, (req, res) => {
   const childId = String(req.params.childId || '');
   const c = children.get(childId);
   if (!c) return res.status(404).json({ error: 'child_not_found' });
