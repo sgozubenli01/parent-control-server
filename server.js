@@ -75,15 +75,33 @@ function childAuth(req, res, next) {
 
 
 function pairingAuth(req, res, next) {
-  const parentToken = req.header('x-api-key');
-  if (process.env.API_KEY && parentToken === process.env.API_KEY) return parentAuth(req, res, next);
-  const childId = String(req.body?.childId || '');
-  const token = req.header('x-device-token');
+  // Child pairing is authenticated by the per-device token returned by /register.
+  // Check it first so the pairing endpoint never accidentally requires the
+  // parent's API_KEY when called from the child device.
+  const childId = String(req.body?.childId || '').trim();
+  const deviceToken = String(req.header('x-device-token') || '').trim();
   const child = children.get(childId);
-  if (!child || !token || token !== child.deviceToken) return res.status(401).json({ error: 'unauthorized' });
-  req.child = child;
-  req.authRole = 'child';
-  next();
+  if (child && deviceToken && deviceToken.length === child.deviceToken.length &&
+      crypto.timingSafeEqual(Buffer.from(deviceToken), Buffer.from(child.deviceToken))) {
+    req.child = child;
+    req.authRole = 'child';
+    return next();
+  }
+
+  // Keep parent API-key compatibility for older clients.
+  const parentToken = String(req.header('x-api-key') || '').trim();
+  const parentCandidates = [
+    process.env.API_KEY,
+    process.env.PARENT_CONTROL_API_KEY
+  ].map(v => String(v || '').trim()).filter(Boolean);
+  const matched = parentCandidates.some(valid => {
+    const a = Buffer.from(parentToken);
+    const b = Buffer.from(valid);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  });
+  if (matched) return parentAuth(req, res, next);
+
+  return res.status(401).json({ error: 'unauthorized_pairing' });
 }
 
 function createChild(childId, name = 'Çocuk') {
