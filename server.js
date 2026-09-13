@@ -141,6 +141,9 @@ app.post('/register', bootstrapAuth, (req, res) => {
     return res.status(410).json({ error: 'child_removed', message: 'Bu çocuk cihazı ebeveyn tarafından kaldırıldı.' });
   }
 
+  // Ebeveyn cihazı silmiş olsa bile aynı fiziksel cihaz SETUP_KEY ile yeniden kayıt olabilir.
+  deletedChildIds.delete(String(childId));
+
   let child = children.get(childId);
   if (!child) {
     child = createChild(childId, name || 'Çocuk');
