@@ -14,9 +14,21 @@ const deletedChildIds = new Set();
 
 function parentAuth(req, res, next) {
   const token = String(req.header('x-api-key') || '').trim();
-  const valid = String(process.env.API_KEY || '').trim();
-  if (!valid || token !== valid) {
-    return res.status(401).json({ error: 'unauthorized' });
+  const candidates = [
+    process.env.API_KEY,
+    process.env.PARENT_CONTROL_API_KEY,
+    process.env.SETUP_KEY,
+    process.env.PARENT_CONTROL_SETUP_KEY
+  ].map(v => String(v || '').trim()).filter(Boolean);
+
+  const matched = candidates.some(valid => {
+    const a = Buffer.from(token);
+    const b = Buffer.from(valid);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  });
+
+  if (!matched) {
+    return res.status(401).json({ error: 'unauthorized', message: 'API_KEY eşleşmedi' });
   }
   req.authRole = 'parent';
   next();
