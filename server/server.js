@@ -8,6 +8,9 @@ app.use(express.json({ limit: '256kb' }));
 
 const children = new Map();
 const pairings = new Map();
+// Parent tarafından silinen cihaz kimlikleri. Çocuk uygulaması tekrar bağlanıp
+// aynı cihazı otomatik olarak yeniden oluşturamasın.
+const deletedChildIds = new Set();
 
 function parentAuth(req, res, next) {
   const token = String(req.header('x-api-key') || '').trim();
@@ -83,7 +86,6 @@ function createChild(childId, name = 'Çocuk') {
     network: 'Bilinmiyor',
     policy: { blocked: [], limits: {} },
     commands: [],
-    uninstallRequest: null,
     deviceToken: crypto.randomBytes(32).toString('hex'),
     lastSeen: Date.now()
   };
@@ -104,6 +106,9 @@ app.get('/config-status', (req, res) => {
 app.post('/register', bootstrapAuth, (req, res) => {
   const { childId, name } = req.body || {};
   if (!childId) return res.status(400).json({ error: 'childId' });
+  if (deletedChildIds.has(String(childId))) {
+    return res.status(410).json({ error: 'child_removed', message: 'Bu çocuk cihazı ebeveyn tarafından kaldırıldı.' });
+  }
 
   let child = children.get(childId);
   if (!child) {
@@ -182,52 +187,23 @@ app.post('/children/:childId/name', parentAuth, (req, res) => {
   res.json({ childId: c.childId, name: c.name });
 });
 
-
-app.post('/uninstall/request', childAuth, (req, res) => {
-  const c = req.child;
-  if (c.uninstallRequest?.status === 'pending') return res.json({ ok: true, status: 'pending' });
-  c.uninstallRequest = { status: 'pending', requestedAt: Date.now(), approvedAt: null, token: null };
-  res.json({ ok: true, status: 'pending', requestedAt: c.uninstallRequest.requestedAt });
-});
-
-app.get('/children/:childId/uninstall', parentAuth, (req, res) => {
-  const c = children.get(String(req.params.childId || ''));
-  if (!c) return res.status(404).json({ error: 'child_not_found' });
-  res.json(c.uninstallRequest || { status: 'none' });
-});
-
-app.post('/children/:childId/uninstall/approve', parentAuth, (req, res) => {
-  const c = children.get(String(req.params.childId || ''));
-  if (!c) return res.status(404).json({ error: 'child_not_found' });
-  if (!c.uninstallRequest || c.uninstallRequest.status !== 'pending') return res.status(409).json({ error: 'no_pending_request' });
-  const token = crypto.randomBytes(32).toString('hex');
-  c.uninstallRequest = { ...c.uninstallRequest, status: 'approved', approvedAt: Date.now(), token, expiresAt: Date.now() + 5 * 60 * 1000 };
-  c.commands.push({ id: crypto.randomUUID(), type: 'uninstall_approved', token, createdAt: Date.now(), expiresAt: c.uninstallRequest.expiresAt });
-  res.json({ ok: true, status: 'approved', expiresAt: c.uninstallRequest.expiresAt });
-});
-
-app.post('/children/:childId/uninstall/reject', parentAuth, (req, res) => {
-  const c = children.get(String(req.params.childId || ''));
-  if (!c) return res.status(404).json({ error: 'child_not_found' });
-  if (!c.uninstallRequest || c.uninstallRequest.status !== 'pending') return res.status(409).json({ error: 'no_pending_request' });
-  c.uninstallRequest = { ...c.uninstallRequest, status: 'rejected', rejectedAt: Date.now(), token: null };
-  res.json({ ok: true, status: 'rejected' });
-});
-
 app.get('/children', parentAuth, (req, res) => {
-  res.json([...children.values()].map(({ childId, name, usage, installedApps, location, locationHistory, battery, network, policy, lastSeen, uninstallRequest }) => ({
-    childId, name, usage, installedApps, location, locationHistory, battery, network, policy, lastSeen, uninstallRequest
+  res.json([...children.values()].map(({ childId, name, usage, installedApps, location, locationHistory, battery, network, policy, lastSeen }) => ({
+    childId, name, usage, installedApps, location, locationHistory, battery, network, policy, lastSeen
   })));
 });
 
 app.delete('/children/:childId', parentAuth, (req, res) => {
-  const childId = String(req.params.childId || '');
-  if (!children.has(childId)) return res.status(404).json({ error: 'child_not_found' });
+  const childId = String(req.params.childId || '').trim();
+  if (!childId) return res.status(400).json({ error: 'childId' });
+
+  // Silme idempotent olsun: kayıt zaten yoksa bile ebeveyn tarafı başarı kabul edebilir.
   children.delete(childId);
+  deletedChildIds.add(childId);
   for (const [code, pairing] of pairings.entries()) {
     if (pairing.childId === childId) pairings.delete(code);
   }
-  res.json({ ok: true, childId });
+  res.json({ ok: true, childId, removed: true });
 });
 
 app.get('/children/:childId/history', parentAuth, (req, res) => {
