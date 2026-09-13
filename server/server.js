@@ -137,11 +137,8 @@ app.get('/config-status', (req, res) => {
 app.post('/register', bootstrapAuth, (req, res) => {
   const { childId, name } = req.body || {};
   if (!childId) return res.status(400).json({ error: 'childId' });
-  if (deletedChildIds.has(String(childId))) {
-    return res.status(410).json({ error: 'child_removed', message: 'Bu çocuk cihazı ebeveyn tarafından kaldırıldı.' });
-  }
-
   // Ebeveyn cihazı silmiş olsa bile aynı fiziksel cihaz SETUP_KEY ile yeniden kayıt olabilir.
+  // Eski v36 davranışındaki 410 burada yeniden eşleştirmeyi engelliyordu.
   deletedChildIds.delete(String(childId));
 
   let child = children.get(childId);
