@@ -76,12 +76,14 @@ function createChild(childId, name = 'Çocuk') {
     childId,
     name,
     usage: [],
+    installedApps: [],
     location: null,
     locationHistory: [],
     battery: null,
     network: 'Bilinmiyor',
     policy: { blocked: [], limits: {} },
     commands: [],
+    uninstallRequest: null,
     deviceToken: crypto.randomBytes(32).toString('hex'),
     lastSeen: Date.now()
   };
@@ -148,9 +150,14 @@ app.post('/pairing/claim', parentAuth, (req, res) => {
 });
 
 app.post('/telemetry', childAuth, (req, res) => {
-  const { usage, location, battery, network } = req.body || {};
+  const { usage, installedApps, location, battery, network } = req.body || {};
   const c = req.child;
   if (Array.isArray(usage)) c.usage = usage;
+  if (Array.isArray(installedApps)) c.installedApps = installedApps.map(a => ({
+    package: String(a?.package || ''),
+    name: String(a?.name || a?.package || '').slice(0, 160),
+    minutes: Number(a?.minutes) || 0
+  })).filter(a => a.package);
   if (location && Number.isFinite(Number(location.lat)) && Number.isFinite(Number(location.lon))) {
     c.location = { lat: Number(location.lat), lon: Number(location.lon), time: Number(location.time) || Date.now() };
     c.locationHistory.push(c.location);
@@ -175,10 +182,52 @@ app.post('/children/:childId/name', parentAuth, (req, res) => {
   res.json({ childId: c.childId, name: c.name });
 });
 
+
+app.post('/uninstall/request', childAuth, (req, res) => {
+  const c = req.child;
+  if (c.uninstallRequest?.status === 'pending') return res.json({ ok: true, status: 'pending' });
+  c.uninstallRequest = { status: 'pending', requestedAt: Date.now(), approvedAt: null, token: null };
+  res.json({ ok: true, status: 'pending', requestedAt: c.uninstallRequest.requestedAt });
+});
+
+app.get('/children/:childId/uninstall', parentAuth, (req, res) => {
+  const c = children.get(String(req.params.childId || ''));
+  if (!c) return res.status(404).json({ error: 'child_not_found' });
+  res.json(c.uninstallRequest || { status: 'none' });
+});
+
+app.post('/children/:childId/uninstall/approve', parentAuth, (req, res) => {
+  const c = children.get(String(req.params.childId || ''));
+  if (!c) return res.status(404).json({ error: 'child_not_found' });
+  if (!c.uninstallRequest || c.uninstallRequest.status !== 'pending') return res.status(409).json({ error: 'no_pending_request' });
+  const token = crypto.randomBytes(32).toString('hex');
+  c.uninstallRequest = { ...c.uninstallRequest, status: 'approved', approvedAt: Date.now(), token, expiresAt: Date.now() + 5 * 60 * 1000 };
+  c.commands.push({ id: crypto.randomUUID(), type: 'uninstall_approved', token, createdAt: Date.now(), expiresAt: c.uninstallRequest.expiresAt });
+  res.json({ ok: true, status: 'approved', expiresAt: c.uninstallRequest.expiresAt });
+});
+
+app.post('/children/:childId/uninstall/reject', parentAuth, (req, res) => {
+  const c = children.get(String(req.params.childId || ''));
+  if (!c) return res.status(404).json({ error: 'child_not_found' });
+  if (!c.uninstallRequest || c.uninstallRequest.status !== 'pending') return res.status(409).json({ error: 'no_pending_request' });
+  c.uninstallRequest = { ...c.uninstallRequest, status: 'rejected', rejectedAt: Date.now(), token: null };
+  res.json({ ok: true, status: 'rejected' });
+});
+
 app.get('/children', parentAuth, (req, res) => {
-  res.json([...children.values()].map(({ childId, name, usage, location, locationHistory, battery, network, policy, lastSeen }) => ({
-    childId, name, usage, location, locationHistory, battery, network, policy, lastSeen
+  res.json([...children.values()].map(({ childId, name, usage, installedApps, location, locationHistory, battery, network, policy, lastSeen, uninstallRequest }) => ({
+    childId, name, usage, installedApps, location, locationHistory, battery, network, policy, lastSeen, uninstallRequest
   })));
+});
+
+app.delete('/children/:childId', parentAuth, (req, res) => {
+  const childId = String(req.params.childId || '');
+  if (!children.has(childId)) return res.status(404).json({ error: 'child_not_found' });
+  children.delete(childId);
+  for (const [code, pairing] of pairings.entries()) {
+    if (pairing.childId === childId) pairings.delete(code);
+  }
+  res.json({ ok: true, childId });
 });
 
 app.get('/children/:childId/history', parentAuth, (req, res) => {
