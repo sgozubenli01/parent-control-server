@@ -84,6 +84,7 @@ function createChild(childId, name = 'Çocuk') {
     locationHistory: [],
     battery: null,
     network: 'Bilinmiyor',
+    notificationEvents: [],
     policy: { blocked: [], limits: {} },
     commands: [],
     deviceToken: crypto.randomBytes(32).toString('hex'),
@@ -155,9 +156,15 @@ app.post('/pairing/claim', parentAuth, (req, res) => {
 });
 
 app.post('/telemetry', childAuth, (req, res) => {
-  const { usage, installedApps, location, battery, network } = req.body || {};
+  const { usage, installedApps, location, battery, network, notificationEvents } = req.body || {};
   const c = req.child;
   if (Array.isArray(usage)) c.usage = usage;
+  if (Array.isArray(notificationEvents)) c.notificationEvents = notificationEvents.map(e => ({
+    app: String(e?.app || '').slice(0, 120),
+    person: String(e?.person || '').slice(0, 160),
+    type: String(e?.type || 'Bildirim').slice(0, 80),
+    time: Number(e?.time) || Date.now()
+  })).filter(e => e.app).slice(-100);
   if (Array.isArray(installedApps)) c.installedApps = installedApps.map(a => ({
     package: String(a?.package || ''),
     name: String(a?.name || a?.package || '').slice(0, 160),
@@ -188,8 +195,8 @@ app.post('/children/:childId/name', parentAuth, (req, res) => {
 });
 
 app.get('/children', parentAuth, (req, res) => {
-  res.json([...children.values()].map(({ childId, name, usage, installedApps, location, locationHistory, battery, network, policy, lastSeen }) => ({
-    childId, name, usage, installedApps, location, locationHistory, battery, network, policy, lastSeen
+  res.json([...children.values()].map(({ childId, name, usage, installedApps, notificationEvents, location, locationHistory, battery, network, policy, lastSeen }) => ({
+    childId, name, usage, installedApps, notificationEvents, location, locationHistory, battery, network, policy, lastSeen
   })));
 });
 
