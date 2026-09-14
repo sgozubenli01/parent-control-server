@@ -130,6 +130,7 @@ function createChild(childId, name = 'Çocuk') {
     extraMinutes: 0,
     extraMinutesDate: dayKey(),
     extraTimeRequest: null,
+    manualLocked: false,
     commands: [],
     deviceToken: crypto.randomBytes(32).toString('hex'),
     lastSeen: Date.now()
@@ -229,7 +230,7 @@ app.post('/telemetry', childAuth, (req, res) => {
   if (Number.isFinite(Number(effectivePolicy.globalLimit))) {
     effectivePolicy.globalLimit = Number(effectivePolicy.globalLimit) + Number(c.extraMinutes || 0);
   }
-  res.json({ ...effectivePolicy, extraMinutes: Number(c.extraMinutes || 0), extraTimeRequest: c.extraTimeRequest, commands });
+  res.json({ ...effectivePolicy, extraMinutes: Number(c.extraMinutes || 0), extraTimeRequest: c.extraTimeRequest, manualLocked: Boolean(c.manualLocked), commands });
 });
 
 app.post('/children/:childId/name', parentAuth, (req, res) => {
@@ -245,8 +246,8 @@ app.post('/children/:childId/name', parentAuth, (req, res) => {
 
 app.get('/children', parentAuth, (req, res) => {
   for (const c of children.values()) ensureExtraTimeDay(c);
-  res.json([...children.values()].map(({ childId, name, usage, installedApps, notificationEvents, location, locationHistory, battery, network, policy, extraMinutes, extraTimeRequest, lastSeen }) => ({
-    childId, name, usage, installedApps, notificationEvents, location, locationHistory, battery, network, policy, extraMinutes: Number(extraMinutes || 0), extraTimeRequest, lastSeen
+  res.json([...children.values()].map(({ childId, name, usage, installedApps, notificationEvents, location, locationHistory, battery, network, policy, extraMinutes, extraTimeRequest, manualLocked, lastSeen }) => ({
+    childId, name, usage, installedApps, notificationEvents, location, locationHistory, battery, network, policy, extraMinutes: Number(extraMinutes || 0), extraTimeRequest, manualLocked: Boolean(manualLocked), lastSeen
   })));
 });
 
@@ -305,8 +306,26 @@ app.post('/children/:childId/lock', parentAuth, (req, res) => {
   const childId = String(req.params.childId || '').trim();
   const c = children.get(childId);
   if (!c) return res.status(404).json({ error: 'child_not_found' });
+  c.manualLocked = true;
   c.commands.push({ id: crypto.randomUUID(), type: 'lock', createdAt: Date.now() });
+  res.json({ ok: true, manualLocked: true });
+});
+
+app.post('/children/:childId/unlock', parentAuth, (req, res) => {
+  const childId = String(req.params.childId || '').trim();
+  const c = children.get(childId);
+  if (!c) return res.status(404).json({ error: 'child_not_found' });
+  c.commands.push({ id: crypto.randomUUID(), type: 'unlock', createdAt: Date.now() });
   res.json({ ok: true });
+});
+
+app.post('/children/:childId/unlock', parentAuth, (req, res) => {
+  const childId = String(req.params.childId || '').trim();
+  const c = children.get(childId);
+  if (!c) return res.status(404).json({ error: 'child_not_found' });
+  c.manualLocked = false;
+  c.commands.push({ id: crypto.randomUUID(), type: 'unlock', createdAt: Date.now() });
+  res.json({ ok: true, manualLocked: false });
 });
 
 app.post('/children/:childId/ring', parentAuth, (req, res) => {
