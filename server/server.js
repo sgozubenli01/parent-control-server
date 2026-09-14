@@ -299,6 +299,7 @@ app.post('/children/:childId/extra-time/approve', parentAuth, (req, res) => {
   if (!c.extraTimeRequest?.pending) return res.status(409).json({ error: 'no_pending_request' });
   c.extraMinutes = Number(c.extraMinutes || 0) + minutes;
   c.extraTimeRequest = { pending: false, approvedMinutes: minutes, approvedAt: Date.now() };
+  c.commands.push({ id: crypto.randomUUID(), type: 'extra_time', minutes, createdAt: Date.now() });
   res.json({ ok: true, minutes, extraMinutes: c.extraMinutes });
 });
 
@@ -315,14 +316,8 @@ app.post('/children/:childId/unlock', parentAuth, (req, res) => {
   const childId = String(req.params.childId || '').trim();
   const c = children.get(childId);
   if (!c) return res.status(404).json({ error: 'child_not_found' });
-  c.commands.push({ id: crypto.randomUUID(), type: 'unlock', createdAt: Date.now() });
-  res.json({ ok: true });
-});
-
-app.post('/children/:childId/unlock', parentAuth, (req, res) => {
-  const childId = String(req.params.childId || '').trim();
-  const c = children.get(childId);
-  if (!c) return res.status(404).json({ error: 'child_not_found' });
+  // Unlock must clear the server-side state BEFORE the next telemetry response.
+  // Otherwise /telemetry sends manualLocked:true again and the child immediately relocks.
   c.manualLocked = false;
   c.commands.push({ id: crypto.randomUUID(), type: 'unlock', createdAt: Date.now() });
   res.json({ ok: true, manualLocked: false });
