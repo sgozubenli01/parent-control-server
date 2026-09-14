@@ -12,6 +12,17 @@ const pairings = new Map();
 // aynı cihazı otomatik olarak yeniden oluşturamasın.
 const deletedChildIds = new Set();
 
+function dayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function ensureExtraTimeDay(c) {
+  if (c.extraMinutesDate !== dayKey()) {
+    c.extraMinutesDate = dayKey();
+    c.extraMinutes = 0;
+  }
+}
+
 function parentAuth(req, res, next) {
   const token = String(req.header('x-api-key') || '').trim();
   const candidates = [
@@ -116,6 +127,9 @@ function createChild(childId, name = 'Çocuk') {
     network: 'Bilinmiyor',
     notificationEvents: [],
     policy: { blocked: [], limits: {} },
+    extraMinutes: 0,
+    extraMinutesDate: dayKey(),
+    extraTimeRequest: null,
     commands: [],
     deviceToken: crypto.randomBytes(32).toString('hex'),
     lastSeen: Date.now()
@@ -209,8 +223,13 @@ app.post('/telemetry', childAuth, (req, res) => {
   if (network) c.network = String(network).slice(0, 40);
   c.lastSeen = Date.now();
 
+  ensureExtraTimeDay(c);
   const commands = c.commands.splice(0, 10);
-  res.json({ ...c.policy, commands });
+  const effectivePolicy = { ...c.policy };
+  if (Number.isFinite(Number(effectivePolicy.globalLimit))) {
+    effectivePolicy.globalLimit = Number(effectivePolicy.globalLimit) + Number(c.extraMinutes || 0);
+  }
+  res.json({ ...effectivePolicy, extraMinutes: Number(c.extraMinutes || 0), extraTimeRequest: c.extraTimeRequest, commands });
 });
 
 app.post('/children/:childId/name', parentAuth, (req, res) => {
@@ -225,8 +244,9 @@ app.post('/children/:childId/name', parentAuth, (req, res) => {
 });
 
 app.get('/children', parentAuth, (req, res) => {
-  res.json([...children.values()].map(({ childId, name, usage, installedApps, notificationEvents, location, locationHistory, battery, network, policy, lastSeen }) => ({
-    childId, name, usage, installedApps, notificationEvents, location, locationHistory, battery, network, policy, lastSeen
+  for (const c of children.values()) ensureExtraTimeDay(c);
+  res.json([...children.values()].map(({ childId, name, usage, installedApps, notificationEvents, location, locationHistory, battery, network, policy, extraMinutes, extraTimeRequest, lastSeen }) => ({
+    childId, name, usage, installedApps, notificationEvents, location, locationHistory, battery, network, policy, extraMinutes: Number(extraMinutes || 0), extraTimeRequest, lastSeen
   })));
 });
 
@@ -260,6 +280,33 @@ app.post('/policy', parentAuth, (req, res) => {
   };
   if (Number.isFinite(Number(policy?.globalLimit))) c.policy.globalLimit = Number(policy.globalLimit);
   res.json({ ok: true, policy: c.policy });
+});
+
+app.post('/extra-time/request', childAuth, (req, res) => {
+  const c = req.child;
+  ensureExtraTimeDay(c);
+  c.extraTimeRequest = { pending: true, requestedAt: Date.now() };
+  res.json({ ok: true, request: c.extraTimeRequest });
+});
+
+app.post('/children/:childId/extra-time/approve', parentAuth, (req, res) => {
+  const childId = String(req.params.childId || '').trim();
+  const minutes = Math.max(5, Math.min(240, Number(req.body?.minutes) || 0));
+  const c = children.get(childId);
+  if (!c) return res.status(404).json({ error: 'child_not_found' });
+  ensureExtraTimeDay(c);
+  if (!c.extraTimeRequest?.pending) return res.status(409).json({ error: 'no_pending_request' });
+  c.extraMinutes = Number(c.extraMinutes || 0) + minutes;
+  c.extraTimeRequest = { pending: false, approvedMinutes: minutes, approvedAt: Date.now() };
+  res.json({ ok: true, minutes, extraMinutes: c.extraMinutes });
+});
+
+app.post('/children/:childId/lock', parentAuth, (req, res) => {
+  const childId = String(req.params.childId || '').trim();
+  const c = children.get(childId);
+  if (!c) return res.status(404).json({ error: 'child_not_found' });
+  c.commands.push({ id: crypto.randomUUID(), type: 'lock', createdAt: Date.now() });
+  res.json({ ok: true });
 });
 
 app.post('/children/:childId/ring', parentAuth, (req, res) => {
