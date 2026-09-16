@@ -50,6 +50,7 @@ function createChildObject(row) {
     extraMinutes: Number(row.extra_minutes || 0),
     extraMinutesDate: row.extra_minutes_date ? String(row.extra_minutes_date).slice(0, 10) : dayKey(),
     extraTimeRequest: safeJson(row.extra_time_request, null),
+    uninstallRequest: safeJson(row.uninstall_request, null),
     manualLocked: Boolean(row.manual_locked),
     lastSeen: Number(row.last_seen || Date.now())
   };
@@ -349,18 +350,15 @@ app.post('/telemetry', childAuth, async (req, res) => {
     let commands = [];
     try {
       await client.query('BEGIN');
+      // Komutları telemetry yanıtında göster ama burada silme.
+      // Çocuk komutu gerçekten uyguladıktan sonra /commands/:id/ack ile siler.
+      // Böylece ağ yanıtı kaybolursa komut kaybolmaz.
       const picked = await client.query(`
-        WITH picked AS (
-          SELECT id FROM commands
-          WHERE child_id = $1
-          ORDER BY created_at ASC
-          LIMIT 10
-          FOR UPDATE SKIP LOCKED
-        )
-        DELETE FROM commands c
-        USING picked p
-        WHERE c.id = p.id
-        RETURNING c.id, c.type, c.minutes, c.created_at
+        SELECT id, type, minutes, created_at
+        FROM commands
+        WHERE child_id = $1
+        ORDER BY created_at ASC
+        LIMIT 10
       `, [c.childId]);
       await client.query('COMMIT');
       commands = picked.rows.map(r => ({ id: r.id, type: r.type, minutes: r.minutes == null ? undefined : Number(r.minutes), createdAt: Number(r.created_at) }));
@@ -419,6 +417,7 @@ app.get('/children', parentAuth, async (req, res) => {
         policy: c.policy,
         extraMinutes: Number(c.extraMinutes || 0),
         extraTimeRequest: c.extraTimeRequest,
+        uninstallRequest: c.uninstallRequest,
         manualLocked: Boolean(c.manualLocked),
         lastSeen: c.lastSeen
       });
@@ -511,6 +510,24 @@ app.post('/policy', parentAuth, async (req, res) => {
   }
 });
 
+app.post('/uninstall-request', childAuth, async (req, res) => {
+  try {
+    const c = req.child;
+    const now = Date.now();
+    const current = safeJson(c.uninstall_request, null);
+    // Do not spam the parent with repeated requests while the same attempt is visible.
+    if (current?.pending && now - Number(current.requestedAt || 0) < 60 * 60 * 1000) {
+      return res.json({ ok: true, request: current, duplicate: true });
+    }
+    const request = { pending: true, requestedAt: now, reason: 'uninstall_attempt' };
+    await pool.query('UPDATE children SET uninstall_request = $2::jsonb WHERE child_id = $1', [c.childId, JSON.stringify(request)]);
+    res.json({ ok: true, request });
+  } catch (err) {
+    console.error('/uninstall-request error:', err);
+    res.status(500).json({ error: 'database_error' });
+  }
+});
+
 app.post('/extra-time/request', childAuth, async (req, res) => {
   try {
     const c = req.child;
@@ -530,6 +547,37 @@ async function pushCommand(childId, type, minutes = null) {
     [crypto.randomUUID(), String(childId), type, minutes == null ? null : Number(minutes), Date.now()]
   );
 }
+
+app.post('/children/:childId/uninstall/approve', parentAuth, async (req, res) => {
+  try {
+    const childId = String(req.params.childId || '').trim();
+    const c = await getChild(childId);
+    if (!c) return res.status(404).json({ error: 'child_not_found' });
+    const request = safeJson(c.uninstall_request, null);
+    if (!request?.pending) return res.status(409).json({ error: 'no_pending_uninstall_request' });
+    const approved = { pending: false, approved: true, approvedAt: Date.now() };
+    await pool.query('UPDATE children SET uninstall_request = $2::jsonb WHERE child_id = $1', [childId, JSON.stringify(approved)]);
+    await pushCommand(childId, 'approve_uninstall');
+    res.json({ ok: true, command: 'approve_uninstall' });
+  } catch (err) {
+    console.error('/uninstall/approve error:', err);
+    res.status(500).json({ error: 'database_error' });
+  }
+});
+
+app.post('/children/:childId/uninstall/reject', parentAuth, async (req, res) => {
+  try {
+    const childId = String(req.params.childId || '').trim();
+    const c = await getChild(childId);
+    if (!c) return res.status(404).json({ error: 'child_not_found' });
+    const rejected = { pending: false, approved: false, rejectedAt: Date.now() };
+    await pool.query('UPDATE children SET uninstall_request = $2::jsonb WHERE child_id = $1', [childId, JSON.stringify(rejected)]);
+    res.json({ ok: true, rejected: true });
+  } catch (err) {
+    console.error('/uninstall/reject error:', err);
+    res.status(500).json({ error: 'database_error' });
+  }
+});
 
 app.post('/children/:childId/extra-time/approve', parentAuth, async (req, res) => {
   try {
@@ -562,6 +610,22 @@ app.post('/children/:childId/lock', parentAuth, async (req, res) => {
     res.json({ ok: true, manualLocked: true });
   } catch (err) {
     console.error('/lock error:', err);
+    res.status(500).json({ error: 'database_error' });
+  }
+});
+
+app.post('/commands/:commandId/ack', childAuth, async (req, res) => {
+  try {
+    const commandId = String(req.params.commandId || '').trim();
+    if (!commandId) return res.status(400).json({ error: 'command_id_required' });
+    const r = await pool.query(
+      'DELETE FROM commands WHERE id = $1 AND child_id = $2 RETURNING id',
+      [commandId, req.child.childId]
+    );
+    if (!r.rowCount) return res.status(404).json({ error: 'command_not_found' });
+    res.json({ ok: true, commandId });
+  } catch (err) {
+    console.error('/commands/:commandId/ack error:', err);
     res.status(500).json({ error: 'database_error' });
   }
 });
@@ -669,6 +733,7 @@ async function initDb() {
       extra_minutes INTEGER NOT NULL DEFAULT 0,
       extra_minutes_date DATE NOT NULL DEFAULT CURRENT_DATE,
       extra_time_request JSONB,
+      uninstall_request JSONB,
       manual_locked BOOLEAN NOT NULL DEFAULT false,
       device_token TEXT NOT NULL,
       last_seen BIGINT NOT NULL DEFAULT 0
@@ -676,6 +741,7 @@ async function initDb() {
     ALTER TABLE children ADD COLUMN IF NOT EXISTS profile_id TEXT NOT NULL DEFAULT '';
     ALTER TABLE children ADD COLUMN IF NOT EXISTS device_name TEXT NOT NULL DEFAULT 'Çocuk cihazı';
     ALTER TABLE children ADD COLUMN IF NOT EXISTS usage_history JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE children ADD COLUMN IF NOT EXISTS uninstall_request JSONB;
     UPDATE children SET profile_id = child_id WHERE profile_id = '';
 
     CREATE TABLE IF NOT EXISTS pairings (
