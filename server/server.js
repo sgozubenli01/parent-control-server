@@ -36,7 +36,10 @@ function createChildObject(row) {
   return {
     childId: row.child_id,
     name: row.name,
+    profileId: row.profile_id || row.child_id,
+    deviceName: row.device_name || 'Çocuk cihazı',
     usage: safeJson(row.usage, []),
+    usageHistory: safeJson(row.usage_history, {}),
     installedApps: safeJson(row.installed_apps, []),
     location: safeJson(row.location, null),
     locationHistory: safeJson(row.location_history, []),
@@ -78,23 +81,25 @@ async function saveChild(child) {
     UPDATE children SET
       name = $2,
       usage = $3::jsonb,
-      installed_apps = $4::jsonb,
-      location = $5::jsonb,
-      location_history = $6::jsonb,
-      battery = $7,
-      network = $8,
-      notification_events = $9::jsonb,
-      policy = $10::jsonb,
-      extra_minutes = $11,
-      extra_minutes_date = $12,
-      extra_time_request = $13::jsonb,
-      manual_locked = $14,
-      last_seen = $15
+      usage_history = $4::jsonb,
+      installed_apps = $5::jsonb,
+      location = $6::jsonb,
+      location_history = $7::jsonb,
+      battery = $8,
+      network = $9,
+      notification_events = $10::jsonb,
+      policy = $11::jsonb,
+      extra_minutes = $12,
+      extra_minutes_date = $13,
+      extra_time_request = $14::jsonb,
+      manual_locked = $15,
+      last_seen = $16
     WHERE child_id = $1
   `, [
     child.childId,
     child.name,
     JSON.stringify(child.usage || []),
+    JSON.stringify(child.usageHistory || {}),
     JSON.stringify(child.installedApps || []),
     child.location == null ? null : JSON.stringify(child.location),
     JSON.stringify(child.locationHistory || []),
@@ -200,24 +205,26 @@ async function pairingAuth(req, res, next) {
   }
 }
 
-async function createChild(childId, name = 'Çocuk') {
+async function createChild(childId, name = 'Çocuk', deviceName = 'Android cihaz') {
   const id = String(childId).trim();
   const childName = String(name || 'Çocuk').slice(0, 80);
+  const deviceLabel = String(deviceName || 'Android cihaz').slice(0, 120);
   const deviceToken = crypto.randomBytes(32).toString('hex');
   const now = Date.now();
   const today = dayKey();
   const { rows } = await pool.query(`
     INSERT INTO children (
-      child_id, name, usage, installed_apps, location, location_history,
+      child_id, name, profile_id, device_name, usage, installed_apps, location, location_history,
       battery, network, notification_events, policy, extra_minutes,
       extra_minutes_date, extra_time_request, manual_locked, device_token, last_seen
-    ) VALUES ($1, $2, '[]'::jsonb, '[]'::jsonb, NULL, '[]'::jsonb,
-              NULL, 'Bilinmiyor', '[]'::jsonb, $3::jsonb, 0, $4, NULL, false, $5, $6)
+    ) VALUES ($1, $2, $1, $3, '[]'::jsonb, '[]'::jsonb, NULL, '[]'::jsonb,
+              NULL, 'Bilinmiyor', '[]'::jsonb, $4::jsonb, 0, $5, NULL, false, $6, $7)
     ON CONFLICT (child_id) DO UPDATE SET
       name = EXCLUDED.name,
+      device_name = EXCLUDED.device_name,
       last_seen = EXCLUDED.last_seen
     RETURNING *
-  `, [id, childName, JSON.stringify({ blocked: [], limits: {} }), today, deviceToken, now]);
+  `, [id, childName, deviceLabel, JSON.stringify({ blocked: [], limits: {} }), today, deviceToken, now]);
   return rows[0];
 }
 
@@ -247,9 +254,9 @@ app.post('/register', bootstrapAuth, async (req, res) => {
     const id = String(childId).trim();
     await pool.query('DELETE FROM deleted_child_ids WHERE child_id = $1', [id]);
     let child = await getChild(id);
-    if (!child) child = await createChild(id, name || 'Çocuk');
+    if (!child) child = await createChild(id, name || 'Çocuk', req.body?.deviceName || 'Android cihaz');
     else {
-      if (name) await pool.query('UPDATE children SET name = $2, last_seen = $3 WHERE child_id = $1', [id, String(name).slice(0, 80), Date.now()]);
+      if (name) await pool.query('UPDATE children SET name = $2, device_name = $3, last_seen = $4 WHERE child_id = $1', [id, String(name).slice(0, 80), String(req.body?.deviceName || child.device_name || 'Android cihaz').slice(0, 120), Date.now()]);
       else await pool.query('UPDATE children SET last_seen = $2 WHERE child_id = $1', [id, Date.now()]);
       child = await getChild(id);
     }
@@ -266,9 +273,9 @@ app.post('/pairing/start', pairingAuth, async (req, res) => {
     if (!childId) return res.status(400).json({ error: 'childId' });
     const id = String(childId).trim();
     let child = await getChild(id);
-    if (!child) child = await createChild(id, name || 'Çocuk');
+    if (!child) child = await createChild(id, name || 'Çocuk', req.body?.deviceName || 'Android cihaz');
     else {
-      if (name) await pool.query('UPDATE children SET name = $2, last_seen = $3 WHERE child_id = $1', [id, String(name).slice(0, 80), Date.now()]);
+      if (name) await pool.query('UPDATE children SET name = $2, device_name = $3, last_seen = $4 WHERE child_id = $1', [id, String(name).slice(0, 80), String(req.body?.deviceName || child.device_name || 'Android cihaz').slice(0, 120), Date.now()]);
       child = await getChild(id);
     }
 
@@ -298,7 +305,7 @@ app.post('/pairing/claim', parentAuth, async (req, res) => {
     await pool.query('DELETE FROM pairings WHERE code = $1', [code]);
     const child = await getChild(pairing.child_id);
     if (!child) return res.status(404).json({ error: 'child_not_found' });
-    res.json({ childId: child.child_id, name: child.name, location: safeJson(child.location, null), lastSeen: Number(child.last_seen || Date.now()) });
+    res.json({ childId: child.child_id, name: child.name, profileId: child.profile_id || child.child_id, deviceName: child.device_name || 'Çocuk cihazı', location: safeJson(child.location, null), lastSeen: Number(child.last_seen || Date.now()) });
   } catch (err) {
     console.error('/pairing/claim error:', err);
     res.status(500).json({ error: 'database_error' });
@@ -309,7 +316,12 @@ app.post('/telemetry', childAuth, async (req, res) => {
   const c = req.child;
   try {
     const { usage, installedApps, location, battery, network, notificationEvents } = req.body || {};
-    if (Array.isArray(usage)) c.usage = usage;
+    if (Array.isArray(usage)) {
+      c.usage = usage;
+      c.usageHistory = { ...(c.usageHistory || {}), [dayKey()]: usage };
+      const keys = Object.keys(c.usageHistory).sort();
+      while (keys.length > 14) delete c.usageHistory[keys.shift()];
+    }
     if (Array.isArray(notificationEvents)) c.notificationEvents = notificationEvents.map(e => ({
       app: String(e?.app || '').slice(0, 120),
       person: String(e?.person || '').slice(0, 160),
@@ -394,7 +406,10 @@ app.get('/children', parentAuth, async (req, res) => {
       result.push({
         childId: c.childId,
         name: c.name,
+        profileId: c.profileId,
+        deviceName: c.deviceName,
         usage: c.usage,
+        usageHistory: c.usageHistory,
         installedApps: c.installedApps,
         notificationEvents: c.notificationEvents,
         location: c.location,
@@ -413,6 +428,33 @@ app.get('/children', parentAuth, async (req, res) => {
     console.error('/children error:', err);
     res.status(500).json({ error: 'database_error' });
   }
+});
+
+app.post('/children/:childId/profile', parentAuth, async (req, res) => {
+  try {
+    const childId = String(req.params.childId || '').trim();
+    const profileId = String(req.body?.profileId || '').trim().slice(0, 120);
+    if (!profileId) return res.status(400).json({ error: 'profileId_required' });
+    const r = await pool.query('UPDATE children SET profile_id = $2 WHERE child_id = $1 RETURNING child_id, profile_id', [childId, profileId]);
+    if (!r.rowCount) return res.status(404).json({ error: 'child_not_found' });
+    res.json({ ok: true, childId: r.rows[0].child_id, profileId: r.rows[0].profile_id });
+  } catch (err) { console.error('/profile error:', err); res.status(500).json({ error: 'database_error' }); }
+});
+
+app.get('/children/:childId/report', parentAuth, async (req, res) => {
+  try {
+    const child = await getChild(String(req.params.childId || '').trim());
+    if (!child) return res.status(404).json({ error: 'child_not_found' });
+    const days = Math.max(1, Math.min(14, Number(req.query?.days) || 7));
+    const history = safeJson(child.usage_history, {});
+    const keys = Object.keys(history).sort().slice(-days);
+    const result = keys.map(date => {
+      const usage = Array.isArray(history[date]) ? history[date] : [];
+      const apps = usage.map(x => ({ package: String(x?.package || ''), name: String(x?.name || x?.package || ''), minutes: Number(x?.minutes || 0) })).filter(x => x.package);
+      return { date, totalMinutes: apps.reduce((a,b)=>a+b.minutes,0), apps: apps.sort((a,b)=>b.minutes-a.minutes) };
+    });
+    res.json({ childId: child.child_id, profileId: child.profile_id || child.child_id, days: result });
+  } catch (err) { console.error('/report error:', err); res.status(500).json({ error: 'database_error' }); }
 });
 
 app.delete('/children/:childId', parentAuth, async (req, res) => {
@@ -524,6 +566,59 @@ app.post('/children/:childId/lock', parentAuth, async (req, res) => {
   }
 });
 
+function serviceCommandHandler(type, label) {
+  return async (req, res) => {
+    try {
+      const childId = String(req.params.childId || '').trim();
+      const c = await getChild(childId);
+      if (!c) return res.status(404).json({ error: 'child_not_found' });
+      await pushCommand(childId, type);
+      res.json({ ok: true, command: type });
+    } catch (err) {
+      console.error(`/children/:childId/${label} error:`, err);
+      res.status(500).json({ error: 'database_error' });
+    }
+  };
+}
+
+app.post('/children/:childId/refresh-services', parentAuth, serviceCommandHandler('refresh_services', 'refresh-services'));
+app.post('/children/:childId/restart-services', parentAuth, serviceCommandHandler('restart_services', 'restart-services'));
+
+// Tek ve kararlı komut endpoint'i. Ebeveyn APK'sı bundan sonra komutu
+// { type: 'refresh_services' | 'restart_services' } gövdesiyle gönderir.
+// Eski endpoint'ler geriye dönük uyumluluk için korunur.
+app.post('/children/:childId/command', parentAuth, async (req, res) => {
+  const type = String(req.body?.type || '').trim();
+  const aliases = new Map([
+    ['refresh', 'refresh_services'],
+    ['refresh-services', 'refresh_services'],
+    ['refresh_services', 'refresh_services'],
+    ['restart', 'restart_services'],
+    ['restart-services', 'restart_services'],
+    ['restart_services', 'restart_services']
+  ]);
+  const command = aliases.get(type);
+  if (!command) return res.status(400).json({ error: 'unknown_command', allowed: ['refresh_services', 'restart_services'] });
+  return serviceCommandHandler(command, 'command')(req, res);
+});
+
+// Komut endpoint'leri için geriye dönük uyumluluk. Bazı eski ebeveyn APK'ları
+// /command/:type veya /services/:type yolunu kullanabilir.
+app.post('/children/:childId/command/:type', parentAuth, async (req, res) => {
+  const type = String(req.params.type || '').trim();
+  const allowed = new Map([['refresh', 'refresh_services'], ['refresh-services', 'refresh_services'], ['restart', 'restart_services'], ['restart-services', 'restart_services']]);
+  const command = allowed.get(type);
+  if (!command) return res.status(400).json({ error: 'unknown_command' });
+  return serviceCommandHandler(command, `command-${type}`)(req, res);
+});
+app.post('/children/:childId/services/:type', parentAuth, async (req, res) => {
+  const type = String(req.params.type || '').trim();
+  const allowed = new Map([['refresh', 'refresh_services'], ['refresh-services', 'refresh_services'], ['restart', 'restart_services'], ['restart-services', 'restart_services']]);
+  const command = allowed.get(type);
+  if (!command) return res.status(400).json({ error: 'unknown_command' });
+  return serviceCommandHandler(command, `services-${type}`)(req, res);
+});
+
 app.post('/children/:childId/unlock', parentAuth, async (req, res) => {
   try {
     const childId = String(req.params.childId || '').trim();
@@ -560,7 +655,10 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS children (
       child_id TEXT PRIMARY KEY,
       name TEXT NOT NULL DEFAULT 'Çocuk',
+      profile_id TEXT NOT NULL DEFAULT '',
+      device_name TEXT NOT NULL DEFAULT 'Çocuk cihazı',
       usage JSONB NOT NULL DEFAULT '[]'::jsonb,
+      usage_history JSONB NOT NULL DEFAULT '{}'::jsonb,
       installed_apps JSONB NOT NULL DEFAULT '[]'::jsonb,
       location JSONB,
       location_history JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -575,6 +673,11 @@ async function initDb() {
       device_token TEXT NOT NULL,
       last_seen BIGINT NOT NULL DEFAULT 0
     );
+    ALTER TABLE children ADD COLUMN IF NOT EXISTS profile_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE children ADD COLUMN IF NOT EXISTS device_name TEXT NOT NULL DEFAULT 'Çocuk cihazı';
+    ALTER TABLE children ADD COLUMN IF NOT EXISTS usage_history JSONB NOT NULL DEFAULT '{}'::jsonb;
+    UPDATE children SET profile_id = child_id WHERE profile_id = '';
+
     CREATE TABLE IF NOT EXISTS pairings (
       code TEXT PRIMARY KEY,
       child_id TEXT NOT NULL REFERENCES children(child_id) ON DELETE CASCADE,
