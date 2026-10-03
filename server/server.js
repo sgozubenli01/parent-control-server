@@ -6,8 +6,32 @@ import pg from 'pg';
 const { Pool } = pg;
 
 const app = express();
+app.set('trust proxy', 1); // Render/Proxy arkasında doğru istemci IP'si için
 app.use(cors());
 app.use(express.json({ limit: '256kb' }));
+
+// Basit bellek içi hız sınırı (saldırganın SETUP_KEY ile istek atmasını yavaşlatır).
+const rateBuckets = new Map();
+function rateLimit(windowMs, max) {
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = `${req.ip || 'unknown'}|${req.baseUrl}${req.path}`;
+    const bucket = rateBuckets.get(key);
+    if (!bucket || now > bucket.resetAt) {
+      rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    bucket.count += 1;
+    if (bucket.count > max) {
+      return res.status(429).json({ error: 'rate_limited', retryAfterSeconds: Math.ceil((bucket.resetAt - now) / 1000) });
+    }
+    next();
+  };
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of rateBuckets) if (now > bucket.resetAt) rateBuckets.delete(key);
+}, 60_000).unref();
 
 const DATABASE_URL = String(process.env.DATABASE_URL || '').trim();
 if (!DATABASE_URL) {
@@ -28,6 +52,29 @@ function dayKey() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function distanceMeters(a, b) {
+  const R = 6371000;
+  const toRad = (x) => (x * Math.PI) / 180;
+  const dLat = toRad(Number(b.lat) - Number(a.lat));
+  const dLon = toRad(Number(b.lon) - Number(a.lon));
+  const lat1 = toRad(Number(a.lat));
+  const lat2 = toRad(Number(b.lat));
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+// Aynı nokta her telemetri tekrar eklenmesin: ya ~50 m yol alınmış olsun ya da
+// en az 15 dakika geçmiş ve ~15 m kaymış olsun. Böylece geçmiş dakikalar içinde
+// dolup silinmez, anlamlı bir rota kalır.
+function shouldRecordLocation(history, point) {
+  if (!Array.isArray(history) || history.length === 0) return true;
+  const last = history[history.length - 1];
+  const dist = distanceMeters(last, point);
+  if (dist >= 50) return true;
+  const elapsed = Number(point.time || 0) - Number(last.time || 0);
+  return elapsed >= 15 * 60 * 1000 && dist >= 15;
+}
+
 function safeJson(value, fallback) {
   return value == null ? fallback : value;
 }
@@ -46,11 +93,12 @@ function createChildObject(row) {
     battery: row.battery == null ? null : Number(row.battery),
     network: row.network || 'Bilinmiyor',
     notificationEvents: safeJson(row.notification_events, []),
+    webHistory: safeJson(row.web_history, []),
+    health: safeJson(row.health, {}),
     policy: safeJson(row.policy, { blocked: [], limits: {} }),
     extraMinutes: Number(row.extra_minutes || 0),
     extraMinutesDate: row.extra_minutes_date ? String(row.extra_minutes_date).slice(0, 10) : dayKey(),
     extraTimeRequest: safeJson(row.extra_time_request, null),
-    uninstallRequest: safeJson(row.uninstall_request, null),
     manualLocked: Boolean(row.manual_locked),
     lastSeen: Number(row.last_seen || Date.now())
   };
@@ -94,7 +142,9 @@ async function saveChild(child) {
       extra_minutes_date = $13,
       extra_time_request = $14::jsonb,
       manual_locked = $15,
-      last_seen = $16
+      last_seen = $16,
+      web_history = $17::jsonb,
+      health = $18::jsonb
     WHERE child_id = $1
   `, [
     child.childId,
@@ -112,18 +162,25 @@ async function saveChild(child) {
     child.extraMinutesDate || dayKey(),
     child.extraTimeRequest == null ? null : JSON.stringify(child.extraTimeRequest),
     Boolean(child.manualLocked),
-    Number(child.lastSeen || Date.now())
+    Number(child.lastSeen || Date.now()),
+    JSON.stringify(child.webHistory || []),
+    JSON.stringify(child.health || {})
   ]);
 }
 
 function parentAuth(req, res, next) {
   const token = String(req.header('x-api-key') || '').trim();
+  // GÜVENLİK: Ebeveyn uç noktası YALNIZCA API_KEY kabul eder.
+  // SETUP_KEY APK'nın içinde bulunduğu için (çocuk cihazına kopyalanabilir)
+  // ebeveyn yetkisi vermemesi gerekir.
   const candidates = [
     process.env.API_KEY,
-    process.env.PARENT_CONTROL_API_KEY,
-    process.env.SETUP_KEY,
-    process.env.PARENT_CONTROL_SETUP_KEY
+    process.env.PARENT_CONTROL_API_KEY
   ].map(v => String(v || '').trim()).filter(Boolean);
+
+  if (!candidates.length) {
+    return res.status(500).json({ error: 'server_not_configured', message: 'Sunucuda API_KEY tanımlı değil' });
+  }
 
   const matched = candidates.some(valid => {
     const a = Buffer.from(token);
@@ -239,7 +296,7 @@ app.get('/health', async (req, res) => {
   }
 });
 
-app.get('/config-status', (req, res) => {
+app.get('/config-status', parentAuth, (req, res) => {
   res.json({
     ok: true,
     apiKeyConfigured: Boolean(String(process.env.API_KEY || '').trim()),
@@ -248,7 +305,7 @@ app.get('/config-status', (req, res) => {
   });
 });
 
-app.post('/register', bootstrapAuth, async (req, res) => {
+app.post('/register', bootstrapAuth, rateLimit(10 * 60 * 1000, 30), async (req, res) => {
   try {
     const { childId, name } = req.body || {};
     if (!childId) return res.status(400).json({ error: 'childId' });
@@ -292,7 +349,7 @@ app.post('/pairing/start', pairingAuth, async (req, res) => {
   }
 });
 
-app.post('/pairing/claim', parentAuth, async (req, res) => {
+app.post('/pairing/claim', parentAuth, rateLimit(10 * 60 * 1000, 20), async (req, res) => {
   try {
     const code = String(req.body?.code || '').trim();
     if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
@@ -316,7 +373,7 @@ app.post('/pairing/claim', parentAuth, async (req, res) => {
 app.post('/telemetry', childAuth, async (req, res) => {
   const c = req.child;
   try {
-    const { usage, installedApps, location, battery, network, notificationEvents } = req.body || {};
+    const { usage, installedApps, location, battery, network, notificationEvents, webHistory } = req.body || {};
     if (Array.isArray(usage)) {
       c.usage = usage;
       c.usageHistory = { ...(c.usageHistory || {}), [dayKey()]: usage };
@@ -327,17 +384,45 @@ app.post('/telemetry', childAuth, async (req, res) => {
       app: String(e?.app || '').slice(0, 120),
       person: String(e?.person || '').slice(0, 160),
       type: String(e?.type || 'Bildirim').slice(0, 80),
-      time: Number(e?.time) || Date.now()
+      time: Number(e?.time) || Date.now(),
+      // Mesaj metni: en fazla 200 karakter, tek satıra indirgenir.
+      body: String(e?.body || '').replace(/\s+/g, ' ').slice(0, 200)
     })).filter(e => e.app).slice(-100);
     if (Array.isArray(installedApps)) c.installedApps = installedApps.map(a => ({
       package: String(a?.package || ''),
       name: String(a?.name || a?.package || '').slice(0, 160),
       minutes: Number(a?.minutes) || 0
     })).filter(a => a.package);
+    // Web etkinliği: yalnızca alan adı kabul edilir (nokta içeren küçük harf),
+    // tam URL/sayfa içeriği değil. Son 300 kayıt saklanır.
+    if (Array.isArray(webHistory)) {
+      c.webHistory = webHistory.map(v => ({
+        domain: String(v?.domain || '').toLowerCase().slice(0, 120),
+        app: String(v?.app || '').slice(0, 160),
+        time: Number(v?.time) || Date.now()
+      })).filter(v => v.domain && /^[a-z0-9.\-]+$/.test(v.domain)).slice(-300);
+    }
+    // Cihaz durumu: çocuk cihazındaki izin/servis bayrakları. clockOk, cihaz saati
+    // ile sunucu saati arasındaki fark 10 dakikayı aşarsa false olur (saat
+    // değiştirilerek günlük limitler sıfırlanamaz).
+    const healthIn = req.body?.health || {};
+    const deviceTime = Number(req.body.deviceTime) || 0;
+    c.health = {
+      accessibility: !!healthIn.accessibility,
+      notifAccess: !!healthIn.notifAccess,
+      usage: !!healthIn.usage,
+      batteryExempt: !!healthIn.batteryExempt,
+      admin: !!healthIn.admin,
+      clockOk: deviceTime > 0 ? Math.abs(Date.now() - deviceTime) < 10 * 60 * 1000 : true
+    };
     if (location && Number.isFinite(Number(location.lat)) && Number.isFinite(Number(location.lon))) {
       c.location = { lat: Number(location.lat), lon: Number(location.lon), time: Number(location.time) || Date.now() };
-      c.locationHistory.push(c.location);
-      if (c.locationHistory.length > 100) c.locationHistory.shift();
+      if (!Array.isArray(c.locationHistory)) c.locationHistory = [];
+      if (shouldRecordLocation(c.locationHistory, c.location)) {
+        c.locationHistory.push(c.location);
+        // Yaklaşık 500 nokta (rota başına ~25-40 KB) tutulur; yazma yükü sınırlı kalır.
+        while (c.locationHistory.length > 500) c.locationHistory.shift();
+      }
     }
     if (Number.isFinite(Number(battery))) c.battery = Math.max(0, Math.min(100, Number(battery)));
     if (network) c.network = String(network).slice(0, 40);
@@ -350,15 +435,18 @@ app.post('/telemetry', childAuth, async (req, res) => {
     let commands = [];
     try {
       await client.query('BEGIN');
-      // Komutları telemetry yanıtında göster ama burada silme.
-      // Çocuk komutu gerçekten uyguladıktan sonra /commands/:id/ack ile siler.
-      // Böylece ağ yanıtı kaybolursa komut kaybolmaz.
       const picked = await client.query(`
-        SELECT id, type, minutes, created_at
-        FROM commands
-        WHERE child_id = $1
-        ORDER BY created_at ASC
-        LIMIT 10
+        WITH picked AS (
+          SELECT id FROM commands
+          WHERE child_id = $1
+          ORDER BY created_at ASC
+          LIMIT 10
+          FOR UPDATE SKIP LOCKED
+        )
+        DELETE FROM commands c
+        USING picked p
+        WHERE c.id = p.id
+        RETURNING c.id, c.type, c.minutes, c.created_at
       `, [c.childId]);
       await client.query('COMMIT');
       commands = picked.rows.map(r => ({ id: r.id, type: r.type, minutes: r.minutes == null ? undefined : Number(r.minutes), createdAt: Number(r.created_at) }));
@@ -410,6 +498,8 @@ app.get('/children', parentAuth, async (req, res) => {
         usageHistory: c.usageHistory,
         installedApps: c.installedApps,
         notificationEvents: c.notificationEvents,
+        webHistory: c.webHistory,
+        health: c.health,
         location: c.location,
         locationHistory: c.locationHistory,
         battery: c.battery,
@@ -417,7 +507,6 @@ app.get('/children', parentAuth, async (req, res) => {
         policy: c.policy,
         extraMinutes: Number(c.extraMinutes || 0),
         extraTimeRequest: c.extraTimeRequest,
-        uninstallRequest: c.uninstallRequest,
         manualLocked: Boolean(c.manualLocked),
         lastSeen: c.lastSeen
       });
@@ -502,28 +591,23 @@ app.post('/policy', parentAuth, async (req, res) => {
       limits: policy?.limits && typeof policy.limits === 'object' ? policy.limits : {}
     };
     if (Number.isFinite(Number(policy?.globalLimit))) nextPolicy.globalLimit = Number(policy.globalLimit);
+    // "Sınırsız" yapılan uygulamalar limits içinde sayısal değer taşımaz; ayrı bir
+    // listede gelir ki eski çocuk APK'ları "unlimited" metnini 0 dakika sanıp
+    // uygulamayı kilitlemesin.
+    if (Array.isArray(policy?.unlimited)) {
+      nextPolicy.unlimited = policy.unlimited.map(v => String(v || '')).filter(Boolean).slice(0, 500);
+    }
+    // Engelli web siteleri: yalnızca normalize edilmiş alan adları saklanır.
+    if (Array.isArray(policy?.blockedDomains)) {
+      nextPolicy.blockedDomains = policy.blockedDomains
+        .map(v => String(v || '').toLowerCase().trim().replace(/^(\*\.)|^www\./, ''))
+        .filter(v => v.length >= 4 && v.length <= 100 && v.includes('.') && /^[a-z0-9.\-]+$/.test(v))
+        .slice(0, 500);
+    }
     await pool.query('UPDATE children SET policy = $2::jsonb WHERE child_id = $1', [String(childId), JSON.stringify(nextPolicy)]);
     res.json({ ok: true, policy: nextPolicy });
   } catch (err) {
     console.error('/policy error:', err);
-    res.status(500).json({ error: 'database_error' });
-  }
-});
-
-app.post('/uninstall-request', childAuth, async (req, res) => {
-  try {
-    const c = req.child;
-    const now = Date.now();
-    const current = safeJson(c.uninstall_request, null);
-    // Do not spam the parent with repeated requests while the same attempt is visible.
-    if (current?.pending && now - Number(current.requestedAt || 0) < 60 * 60 * 1000) {
-      return res.json({ ok: true, request: current, duplicate: true });
-    }
-    const request = { pending: true, requestedAt: now, reason: 'uninstall_attempt' };
-    await pool.query('UPDATE children SET uninstall_request = $2::jsonb WHERE child_id = $1', [c.childId, JSON.stringify(request)]);
-    res.json({ ok: true, request });
-  } catch (err) {
-    console.error('/uninstall-request error:', err);
     res.status(500).json({ error: 'database_error' });
   }
 });
@@ -547,37 +631,6 @@ async function pushCommand(childId, type, minutes = null) {
     [crypto.randomUUID(), String(childId), type, minutes == null ? null : Number(minutes), Date.now()]
   );
 }
-
-app.post('/children/:childId/uninstall/approve', parentAuth, async (req, res) => {
-  try {
-    const childId = String(req.params.childId || '').trim();
-    const c = await getChild(childId);
-    if (!c) return res.status(404).json({ error: 'child_not_found' });
-    const request = safeJson(c.uninstall_request, null);
-    if (!request?.pending) return res.status(409).json({ error: 'no_pending_uninstall_request' });
-    const approved = { pending: false, approved: true, approvedAt: Date.now() };
-    await pool.query('UPDATE children SET uninstall_request = $2::jsonb WHERE child_id = $1', [childId, JSON.stringify(approved)]);
-    await pushCommand(childId, 'approve_uninstall');
-    res.json({ ok: true, command: 'approve_uninstall' });
-  } catch (err) {
-    console.error('/uninstall/approve error:', err);
-    res.status(500).json({ error: 'database_error' });
-  }
-});
-
-app.post('/children/:childId/uninstall/reject', parentAuth, async (req, res) => {
-  try {
-    const childId = String(req.params.childId || '').trim();
-    const c = await getChild(childId);
-    if (!c) return res.status(404).json({ error: 'child_not_found' });
-    const rejected = { pending: false, approved: false, rejectedAt: Date.now() };
-    await pool.query('UPDATE children SET uninstall_request = $2::jsonb WHERE child_id = $1', [childId, JSON.stringify(rejected)]);
-    res.json({ ok: true, rejected: true });
-  } catch (err) {
-    console.error('/uninstall/reject error:', err);
-    res.status(500).json({ error: 'database_error' });
-  }
-});
 
 app.post('/children/:childId/extra-time/approve', parentAuth, async (req, res) => {
   try {
@@ -614,22 +667,6 @@ app.post('/children/:childId/lock', parentAuth, async (req, res) => {
   }
 });
 
-app.post('/commands/:commandId/ack', childAuth, async (req, res) => {
-  try {
-    const commandId = String(req.params.commandId || '').trim();
-    if (!commandId) return res.status(400).json({ error: 'command_id_required' });
-    const r = await pool.query(
-      'DELETE FROM commands WHERE id = $1 AND child_id = $2 RETURNING id',
-      [commandId, req.child.childId]
-    );
-    if (!r.rowCount) return res.status(404).json({ error: 'command_not_found' });
-    res.json({ ok: true, commandId });
-  } catch (err) {
-    console.error('/commands/:commandId/ack error:', err);
-    res.status(500).json({ error: 'database_error' });
-  }
-});
-
 function serviceCommandHandler(type, label) {
   return async (req, res) => {
     try {
@@ -647,41 +684,8 @@ function serviceCommandHandler(type, label) {
 
 app.post('/children/:childId/refresh-services', parentAuth, serviceCommandHandler('refresh_services', 'refresh-services'));
 app.post('/children/:childId/restart-services', parentAuth, serviceCommandHandler('restart_services', 'restart-services'));
-
-// Tek ve kararlı komut endpoint'i. Ebeveyn APK'sı bundan sonra komutu
-// { type: 'refresh_services' | 'restart_services' } gövdesiyle gönderir.
-// Eski endpoint'ler geriye dönük uyumluluk için korunur.
-app.post('/children/:childId/command', parentAuth, async (req, res) => {
-  const type = String(req.body?.type || '').trim();
-  const aliases = new Map([
-    ['refresh', 'refresh_services'],
-    ['refresh-services', 'refresh_services'],
-    ['refresh_services', 'refresh_services'],
-    ['restart', 'restart_services'],
-    ['restart-services', 'restart_services'],
-    ['restart_services', 'restart_services']
-  ]);
-  const command = aliases.get(type);
-  if (!command) return res.status(400).json({ error: 'unknown_command', allowed: ['refresh_services', 'restart_services'] });
-  return serviceCommandHandler(command, 'command')(req, res);
-});
-
-// Komut endpoint'leri için geriye dönük uyumluluk. Bazı eski ebeveyn APK'ları
-// /command/:type veya /services/:type yolunu kullanabilir.
-app.post('/children/:childId/command/:type', parentAuth, async (req, res) => {
-  const type = String(req.params.type || '').trim();
-  const allowed = new Map([['refresh', 'refresh_services'], ['refresh-services', 'refresh_services'], ['restart', 'restart_services'], ['restart-services', 'restart_services']]);
-  const command = allowed.get(type);
-  if (!command) return res.status(400).json({ error: 'unknown_command' });
-  return serviceCommandHandler(command, `command-${type}`)(req, res);
-});
-app.post('/children/:childId/services/:type', parentAuth, async (req, res) => {
-  const type = String(req.params.type || '').trim();
-  const allowed = new Map([['refresh', 'refresh_services'], ['refresh-services', 'refresh_services'], ['restart', 'restart_services'], ['restart-services', 'restart_services']]);
-  const command = allowed.get(type);
-  if (!command) return res.status(400).json({ error: 'unknown_command' });
-  return serviceCommandHandler(command, `services-${type}`)(req, res);
-});
+// Kaldırma/zorla durdurma korumasını 2 dakikalığına durdur (ebeveyn onayıyla geçici kapı).
+app.post('/children/:childId/allow-settings', parentAuth, serviceCommandHandler('allow_settings', 'allow-settings'));
 
 app.post('/children/:childId/unlock', parentAuth, async (req, res) => {
   try {
@@ -729,11 +733,12 @@ async function initDb() {
       battery DOUBLE PRECISION,
       network TEXT NOT NULL DEFAULT 'Bilinmiyor',
       notification_events JSONB NOT NULL DEFAULT '[]'::jsonb,
+      web_history JSONB NOT NULL DEFAULT '[]'::jsonb,
+      health JSONB NOT NULL DEFAULT '{}'::jsonb,
       policy JSONB NOT NULL DEFAULT '{"blocked":[],"limits":{}}'::jsonb,
       extra_minutes INTEGER NOT NULL DEFAULT 0,
       extra_minutes_date DATE NOT NULL DEFAULT CURRENT_DATE,
       extra_time_request JSONB,
-      uninstall_request JSONB,
       manual_locked BOOLEAN NOT NULL DEFAULT false,
       device_token TEXT NOT NULL,
       last_seen BIGINT NOT NULL DEFAULT 0
@@ -741,7 +746,8 @@ async function initDb() {
     ALTER TABLE children ADD COLUMN IF NOT EXISTS profile_id TEXT NOT NULL DEFAULT '';
     ALTER TABLE children ADD COLUMN IF NOT EXISTS device_name TEXT NOT NULL DEFAULT 'Çocuk cihazı';
     ALTER TABLE children ADD COLUMN IF NOT EXISTS usage_history JSONB NOT NULL DEFAULT '{}'::jsonb;
-    ALTER TABLE children ADD COLUMN IF NOT EXISTS uninstall_request JSONB;
+    ALTER TABLE children ADD COLUMN IF NOT EXISTS web_history JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE children ADD COLUMN IF NOT EXISTS health JSONB NOT NULL DEFAULT '{}'::jsonb;
     UPDATE children SET profile_id = child_id WHERE profile_id = '';
 
     CREATE TABLE IF NOT EXISTS pairings (
