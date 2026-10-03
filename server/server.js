@@ -686,6 +686,9 @@ app.post('/children/:childId/refresh-services', parentAuth, serviceCommandHandle
 app.post('/children/:childId/restart-services', parentAuth, serviceCommandHandler('restart_services', 'restart-services'));
 // Kaldırma/zorla durdurma korumasını 2 dakikalığına durdur (ebeveyn onayıyla geçici kapı).
 app.post('/children/:childId/allow-settings', parentAuth, serviceCommandHandler('allow_settings', 'allow-settings'));
+// Ebeveyn, cocugun ana ekran uygulama simgesini gizle/goster.
+app.post('/children/:childId/show-icon', parentAuth, serviceCommandHandler('show_icon', 'show-icon'));
+app.post('/children/:childId/hide-icon', parentAuth, serviceCommandHandler('hide_icon', 'hide-icon'));
 
 app.post('/children/:childId/unlock', parentAuth, async (req, res) => {
   try {
