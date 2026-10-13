@@ -79,6 +79,15 @@ function safeJson(value, fallback) {
   return value == null ? fallback : value;
 }
 
+// PostgreSQL DATE sütunları pg tarafından JS Date nesnesine çevrilir. String(date)
+// "Wed Oct 14 2026 ..." verir; slice(0,10) bunu "Wed Oct 1" gibi bozuk bir güne
+// indirgerdi. Doğru karşılaştırma için takvim gününü (YYYY-MM-DD) döndürür.
+function toDateKey(value) {
+  if (!value) return '';
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  return String(value).slice(0, 10);
+}
+
 function createChildObject(row) {
   return {
     childId: row.child_id,
@@ -97,7 +106,7 @@ function createChildObject(row) {
     health: safeJson(row.health, {}),
     policy: safeJson(row.policy, { blocked: [], limits: {} }),
     extraMinutes: Number(row.extra_minutes || 0),
-    extraMinutesDate: row.extra_minutes_date ? String(row.extra_minutes_date).slice(0, 10) : dayKey(),
+    extraMinutesDate: toDateKey(row.extra_minutes_date) || dayKey(),
     extraTimeRequest: safeJson(row.extra_time_request, null),
     manualLocked: Boolean(row.manual_locked),
     lastSeen: Number(row.last_seen || Date.now())
@@ -115,7 +124,7 @@ async function getChild(childId) {
 
 async function ensureExtraTimeDay(child) {
   const today = dayKey();
-  if (String(child.extraMinutesDate || '').slice(0, 10) !== today) {
+  if (toDateKey(child.extraMinutesDate) !== today) {
     child.extraMinutesDate = today;
     child.extraMinutes = 0;
     await pool.query(
@@ -638,7 +647,7 @@ app.post('/children/:childId/extra-time/approve', parentAuth, async (req, res) =
     const minutes = Math.max(5, Math.min(240, Number(req.body?.minutes) || 0));
     const c = await getChild(childId);
     if (!c) return res.status(404).json({ error: 'child_not_found' });
-    const extraDate = c.extra_minutes_date ? String(c.extra_minutes_date).slice(0, 10) : dayKey();
+    const extraDate = toDateKey(c.extra_minutes_date) || dayKey();
     let extraMinutes = Number(c.extra_minutes || 0);
     if (extraDate !== dayKey()) extraMinutes = 0;
     const request = safeJson(c.extra_time_request, null);
