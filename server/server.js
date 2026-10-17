@@ -783,14 +783,47 @@ async function initDb() {
   console.log('PostgreSQL database ready');
 }
 
-async function start() {
-  await initDb();
-  app.listen(process.env.PORT || 8080, () => {
-    console.log('Parent Control server running');
-  });
+// Render tarafında DNS/veritabanı geçici olarak erişilemez olabiliyor (bakım penceresi,
+// soğuk başlangıç, bölge/DNS değişikliği). Eski kodda `initDb()` hatası doğrudan
+// `process.exit(1)` ile sonuçlanıyordu ve servis sonsuz bir "Server startup failed"
+// döngüsüne giriyordu. Artık port hemen açılıyor, veritabanı arka planda üstel geri
+// çekilme (exponential backoff) ile deneniyor; süreç hiç çıkmıyor.
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let dbReady = false;
+let lastDbError = null;
+
+async function initDbUntilReady() {
+  let attempt = 0;
+  while (!dbReady) {
+    attempt += 1;
+    try {
+      await initDb();
+      dbReady = true;
+      lastDbError = null;
+      return;
+    } catch (err) {
+      lastDbError = err;
+      const delayMs = Math.min(30_000, 2_000 * (2 ** Math.min(attempt - 1, 4)));
+      console.error(`[db] initDb ${attempt}. denemede basarisiz: ${err.code || err.message}`);
+      console.error(`[db] ${Math.round(delayMs / 1000)} saniye sonra yeniden denenecek`);
+      await sleepMs(delayMs);
+    }
+  }
 }
+
+async function start() {
+  const port = Number(process.env.PORT) || 8080;
+  // Port hemen açılsın ki Render sağlığı "No open ports detected" diye servisi öldürmesin.
+  app.listen(port, () => console.log(`Parent Control server running (port ${port})`));
+  await initDbUntilReady();
+}
+
+// Süreç hiç çıkmasın: beklenmeyen reddetmeleri loglayıp yaşamaya devam et.
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err && err.stack ? err.stack : err);
+});
 
 start().catch((err) => {
   console.error('Server startup failed:', err);
-  process.exit(1);
 });
